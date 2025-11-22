@@ -1,0 +1,336 @@
+
+import torch
+print(torch.__version__)
+
+import numpy as np
+import pandas as pd
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from google.colab import drive
+import tensorflow as tf
+
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# ===== Hyperparameters =====
+BUFFER_SIZE = 50000
+LRUM_HISTORY = 5000        # how many recent experiences LRUM keeps after overflow
+BATCH_SIZE = 128
+NUM_EPOCHS = 5           # number of passes through dataset (offline)
+GAMMA = 0.99
+TAU = 0.005
+ACTOR_LR = 3e-4
+CRITIC_LR = 1e-3
+SEED = 420
+mu=0.3
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+# ===== Load dataset =====
+df = pd.read_csv("/content/drive/MyDrive/dataset1_combined.csv")
+print("Loaded dataset shape:", df.shape)
+print("Columns:", df.columns.tolist())
+
+# Drop non-numeric columns for state construction
+non_state_cols = ['Series', 'Time']
+numeric_cols = [c for c in df.columns if c not in non_state_cols]
+print("Numeric columns used for state:", numeric_cols)
+
+# Choose action columns
+if 'CPU_Load' in numeric_cols and 'Power' in numeric_cols:
+    action_cols = ['CPU_Load', 'Power']
+else:
+    action_cols = numeric_cols[:2]
+print("Action columns used:", action_cols)
+
+# State columns
+state_cols = numeric_cols
+state_dim = len(state_cols)
+action_dim = len(action_cols)
+print("State dim:", state_dim, "Action dim:", action_dim)
+
+# Normalize numeric columns to [0,1]
+scaler = MinMaxScaler()
+scaled = scaler.fit_transform(df[state_cols].values)
+data_scaled = pd.DataFrame(scaled, columns=state_cols)
+
+action_scaled = data_scaled[action_cols].values
+state_scaled = data_scaled[state_cols].values
+
+# Build transitions (but only first 100)
+power_idx = state_cols.index('Power') if 'Power' in state_cols else None
+
+experiences = []
+N = len(df)
+max_exp = 100   # <===== LIMIT TO FIRST 100 EXPERIENCES
+
+for i in range(min(N-1, max_exp)):
+    s = state_scaled[i]
+    a = action_scaled[i]
+
+    # reward: negative power
+    if power_idx is not None:
+        reward = -float(state_scaled[i+1, power_idx])
+    else:
+        reward = -float(np.sum(state_scaled[i+1]))
+
+    s_next = state_scaled[i+1]
+    done = True if i == max_exp-1 else False
+
+    experiences.append(
+        (s.astype(np.float32),
+         a.astype(np.float32),
+         float(reward),
+         s_next.astype(np.float32),
+         float(done))
+    )
+
+print("Constructed", len(experiences), "experiences")
+
+# ===== Networks =====
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, action_range=1.0):
+        super().__init__()
+        self.action_range = action_range
+        self.fc1 = nn.Linear(state_dim, 516)
+        self.fc2 = nn.Linear(516, 500)
+        self.fc3 = nn.Linear(500, action_dim)
+    def forward(self, s):
+        x = torch.relu(self.fc1(s))
+        x = torch.relu(self.fc2(x))
+        a = torch.tanh(self.fc3(x)) * self.action_range
+        return a
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, 400)
+        self.fc2 = nn.Linear(400, 300)
+        self.fc3 = nn.Linear(300, 1)
+    def forward(self, s, a):
+        x = torch.relu(self.fc1(torch.cat([s, a], dim=1)))
+        x = torch.relu(self.fc2(x))
+        q = self.fc3(x)
+        return q
+
+# ===== Replay buffers: PER-only and LRUM+PER =====
+class PERReplay:
+    """Simple prioritized replay: store (s,a,r,s',done,td) and sample from top-k priorities"""
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []  # list of tuples
+        self.count = 0
+
+    def add(self, experience, td_error):
+        # store with current td_error
+        if self.count < self.capacity:
+            self.buffer.append((experience, float(td_error)))
+            self.count += 1
+        else:
+            # Once full, overwrite oldest experiences (FIFO)
+            self.buffer[self.count % self.capacity] = (experience, float(td_error))
+            self.count += 1
+
+    def update_td(self, idx, new_td):
+        exp, _ = self.buffer[idx]
+        self.buffer[idx] = (exp, float(new_td))
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def sample(self, batch_size):
+        if len(self.buffer) == 0:
+            return []
+        # prioritize by td: sample uniformly from top-k where k = min(4*batch_size, len)
+        sorted_buf = sorted(self.buffer, key=lambda x: x[1], reverse=True)
+        k = min(len(sorted_buf), max(batch_size*4, batch_size))
+        topk = sorted_buf[:k]
+        sampled = random.sample(topk, min(batch_size, len(topk)))
+        # return list of experiences (without td)
+        return [s for (s, td) in sampled]
+
+
+class LRUM_PER_Replay:
+    """LRUM + PER: when capacity exceeded, keep only most recent lrum_history items"""
+    def __init__(self, capacity, lrum_history):
+        self.capacity = capacity
+        self.lrum_history = lrum_history
+        self.buffer = []
+        self.count = 0
+    def add(self, experience, td_error):
+        self.buffer.append((experience, float(td_error)))
+        self.count += 1
+        if self.count > self.capacity:
+            # First: keep recent entries (LRUM eviction)
+            # We'll keep last lrum_history entries (most recent)
+            # To keep priorities meaningful, we don't sort here; we simply evict older entries
+            # Equivalent to: self.buffer = self.buffer[-self.lrum_history:]
+            self.buffer = self.buffer[-self.lrum_history:]
+            # reset count to reflect current length to avoid repeated large growth
+            self.count = len(self.buffer)
+    def update_td(self, idx, new_td):
+        exp, _ = self.buffer[idx]
+        self.buffer[idx] = (exp, float(new_td))
+    def __len__(self):
+        return len(self.buffer)
+    def sample(self, batch_size):
+        if len(self.buffer) == 0:
+            return []
+        # PER step: prioritize by td
+        sorted_buf = sorted(self.buffer, key=lambda x: x[1], reverse=True)
+        k = min(len(sorted_buf), max(batch_size*4, batch_size))
+        topk = sorted_buf[:k]
+        sampled = random.sample(topk, min(batch_size, len(topk)))
+        return [s for (s, td) in sampled]
+
+# ===== DDPG Agent (uses its own replay buffer) =====
+class DDPGAgent:
+    def __init__(self, state_dim, action_dim, buffer_obj, actor_lr=ACTOR_LR, critic_lr=CRITIC_LR):
+        self.actor = Actor(state_dim, action_dim).to(device)
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.target_actor = Actor(state_dim, action_dim).to(device)
+        self.target_critic = Critic(state_dim, action_dim).to(device)
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        self.a_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.c_opt = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.buffer = buffer_obj
+        self.gamma = GAMMA
+        self.tau = TAU
+
+    def soft_update(self):
+        for tp, p in zip(self.target_actor.parameters(), self.actor.parameters()):
+            tp.data.copy_(self.tau * p.data + (1.0 - self.tau) * tp.data)
+        for tp, p in zip(self.target_critic.parameters(), self.critic.parameters()):
+            tp.data.copy_(self.tau * p.data + (1.0 - self.tau) * tp.data)
+
+    def compute_td_error(self, s, a, r, s_next, done):
+        # compute TD error magnitude: | y - Q(s,a) |
+        self.actor.eval(); self.critic.eval(); self.target_actor.eval(); self.target_critic.eval()
+        with torch.no_grad():
+            s_t = torch.FloatTensor(s).unsqueeze(0).to(device)
+            a_t = torch.FloatTensor(a).unsqueeze(0).to(device)
+            s_next_t = torch.FloatTensor(s_next).unsqueeze(0).to(device)
+            r_t = torch.FloatTensor([r]).to(device)
+            done_t = torch.FloatTensor([done]).to(device)
+
+            q_pred = self.critic(s_t, a_t).squeeze(0)
+            a_next = self.target_actor(s_next_t)
+            q_target_next = self.target_critic(s_next_t, a_next).squeeze(0)
+            y = r_t + (1.0 - done_t) * self.gamma * q_target_next
+            td = float(torch.abs(y - q_pred).cpu().item())
+        self.actor.train(); self.critic.train(); self.target_actor.train(); self.target_critic.train()
+        return td
+
+    def train_step(self, batch_size):
+        batch = self.buffer.sample(batch_size)
+        if len(batch) == 0:
+            return None, None
+        states = torch.FloatTensor(np.stack([b[0] for b in batch])).to(device)
+        actions = torch.FloatTensor(np.stack([b[1] for b in batch])).to(device)
+        rewards = torch.FloatTensor(np.array([b[2] for b in batch], dtype=np.float32)).unsqueeze(1).to(device)
+        next_states = torch.FloatTensor(np.stack([b[3] for b in batch])).to(device)
+        dones = torch.FloatTensor(np.array([b[4] for b in batch], dtype=np.float32)).unsqueeze(1).to(device)
+
+        # Critic update
+        with torch.no_grad():
+            target_actions = self.target_actor(next_states)
+            target_q = self.target_critic(next_states, target_actions)
+            y = rewards + (1.0 - dones) * self.gamma * target_q
+
+        q_values = self.critic(states, actions)
+        critic_loss = nn.MSELoss()(q_values, y)
+
+        self.c_opt.zero_grad()
+        critic_loss.backward()
+        self.c_opt.step()
+
+        # Actor update (maximize Q)
+        actor_loss = -self.critic(states, self.actor(states)).mean()
+        self.a_opt.zero_grad()
+        actor_loss.backward()
+        self.a_opt.step()
+
+        # soft update
+        self.soft_update()
+
+        return float(critic_loss.item()), float(actor_loss.item())
+# ===== Initialize two agents: PER-only and LRUM+PER =====
+per_buffer = PERReplay(capacity=BUFFER_SIZE)
+lrum_buffer = LRUM_PER_Replay(capacity=BUFFER_SIZE, lrum_history=LRUM_HISTORY)
+
+agent_per = DDPGAgent(state_dim, action_dim, per_buffer)
+agent_lrum = DDPGAgent(state_dim, action_dim, lrum_buffer)
+
+# ===== Offline training loop: iterate through experiences (multiple epochs) =====
+losses_per = []          # total loss per training step for PER agent (critic+actor)
+losses_lrum = []         # total loss per training step for LRUM agent
+mem_per = []             # buffer sizes over time (PER)
+mem_lrum = []            # buffer sizes over time (LRUM)
+
+steps = 0
+for epoch in range(NUM_EPOCHS):
+    random.shuffle(experiences)  # shuffle offline dataset each epoch
+    epoch_critic_per, epoch_actor_per = [], []
+    epoch_critic_lrum, epoch_actor_lrum = [], []
+
+    for (s,a,r,s_next,done) in experiences:
+        # compute td-errors using each agent (so priorities reflect each agent's critics)
+        td_per = agent_per.compute_td_error(s,a,r,s_next,done)
+        td_lrum = agent_lrum.compute_td_error(s,a,r,s_next,done)
+
+        # add to buffers
+        per_buffer.add((s,a,r,s_next,done), td_per)
+        lrum_buffer.add((s,a,r,s_next,done), td_lrum)
+
+        # training step for each agent (if enough samples)
+        if len(per_buffer) >= BATCH_SIZE:
+            c_loss, a_loss = agent_per.train_step(BATCH_SIZE)
+            if c_loss is not None:
+                epoch_critic_per.append(c_loss)
+                epoch_actor_per.append(a_loss)
+                losses_per.append(c_loss + a_loss)
+        if len(lrum_buffer) >= BATCH_SIZE:
+            c_loss, a_loss = agent_lrum.train_step(BATCH_SIZE)
+            if c_loss is not None:
+                epoch_critic_lrum.append(c_loss)
+                epoch_actor_lrum.append(a_loss)
+                losses_lrum.append(c_loss + a_loss)
+
+        mem_per.append(len(per_buffer))
+        mem_lrum.append(len(lrum_buffer))
+        steps += 1
+
+    # print epoch summary
+    print(f"Epoch {epoch+1}/{NUM_EPOCHS}  PERM: avg losses C={np.mean(epoch_critic_per) if epoch_critic_per else None}, A={np.mean(epoch_actor_per) if epoch_actor_per else None} | LRUM: C={np.mean(epoch_critic_lrum) if epoch_critic_lrum else None}, A={np.mean(epoch_actor_lrum) if epoch_actor_lrum else None}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
