@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-from google.colab import drive
 import tensorflow as tf
 
 
@@ -310,6 +309,7 @@ for epoch in range(NUM_EPOCHS):
 
     # print epoch summary
     print(f"Epoch {epoch+1}/{NUM_EPOCHS}  PERM: avg losses C={np.mean(epoch_critic_per) if epoch_critic_per else None}, A={np.mean(epoch_actor_per) if epoch_actor_per else None} | LRUM: C={np.mean(epoch_critic_lrum) if epoch_critic_lrum else None}, A={np.mean(epoch_actor_lrum) if epoch_actor_lrum else None}")
+
 
 
 
